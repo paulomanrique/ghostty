@@ -124,6 +124,10 @@ height: u32 = 600,
 /// Last known cursor position in client pixels.
 cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
 
+/// Set on a right-button press that the core didn't consume; the
+/// context menu opens on the matching release.
+context_menu_pending: bool = false,
+
 /// UTF-8 window title cache for title reporting.
 title_buf: [1024:0]u8 = [_:0]u8{0} ** 1024,
 progress_hwnd: ?HWND = null,

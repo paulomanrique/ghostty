@@ -55,7 +55,19 @@ extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn SetLayeredWindowAttributes(hWnd: HWND, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(.winapi) BOOL;
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.winapi) BOOL;
+extern "user32" fn CreatePopupMenu() callconv(.winapi) sys.HMENU;
+extern "user32" fn AppendMenuW(hMenu: sys.HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) BOOL;
+extern "user32" fn TrackPopupMenu(hMenu: sys.HMENU, uFlags: UINT, x: i32, y: i32, nReserved: c_int, hWnd: HWND, prcRect: ?*const RECT) callconv(.winapi) i32;
+extern "user32" fn DestroyMenu(hMenu: sys.HMENU) callconv(.winapi) BOOL;
+extern "user32" fn ClientToScreen(hWnd: HWND, lpPoint: *sys.POINT) callconv(.winapi) BOOL;
 const WS_EX_LAYERED: u32 = 0x00080000;
+
+const MF_STRING: UINT = 0x00000000;
+const MF_GRAYED: UINT = 0x00000001;
+const MF_POPUP: UINT = 0x00000010;
+const MF_SEPARATOR: UINT = 0x00000800;
+const TPM_RIGHTBUTTON: UINT = 0x00000002;
+const TPM_RETURNCMD: UINT = 0x00000100;
 
 const FLASHWINFO = extern struct {
     cbSize: UINT,
@@ -1431,7 +1443,10 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                     0x0207 => .middle,
                     else => .unknown,
                 };
-                _ = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
+                const consumed = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
+                // A right press the core doesn't consume (e.g. no mouse
+                // reporting active) opens the context menu on release.
+                surface.context_menu_pending = button == .right and !consumed;
                 _ = SetCapture(hwnd);
                 _ = sys.SetFocus(hwnd);
                 if (surface.window) |w| {
@@ -1456,6 +1471,10 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 };
                 _ = core.mouseButtonCallback(.release, button, getModifiers()) catch false;
                 _ = ReleaseCapture();
+                if (button == .right and surface.context_menu_pending) {
+                    surface.context_menu_pending = false;
+                    showContextMenu(surface, hwnd);
+                }
             }
             return 0;
         },
@@ -1517,4 +1536,82 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Command IDs for the right-click context menu. Must be non-zero since
+/// TrackPopupMenu with TPM_RETURNCMD returns 0 for "no selection".
+const ContextMenuCmd = enum(usize) {
+    copy = 1,
+    paste,
+    clear,
+    reset,
+    split_right,
+    split_down,
+    split_left,
+    split_up,
+    change_title,
+    command_palette,
+    _,
+};
+
+/// Show the right-click context menu at the surface's last cursor
+/// position and perform the selected action. Mirrors the GTK apprt's
+/// context menu (copy/paste/clear/reset/split/title).
+fn showContextMenu(surface: *Surface, hwnd: HWND) void {
+    const core = surface.core_surface orelse return;
+    const input = @import("../../input.zig");
+
+    const menu = CreatePopupMenu() orelse return;
+    defer _ = DestroyMenu(menu);
+
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const copy_flags: UINT = if (core.hasSelection()) MF_STRING else MF_STRING | MF_GRAYED;
+    _ = AppendMenuW(menu, copy_flags, @intFromEnum(ContextMenuCmd.copy), L("Copy"));
+    _ = AppendMenuW(menu, MF_STRING, @intFromEnum(ContextMenuCmd.paste), L("Paste"));
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    _ = AppendMenuW(menu, MF_STRING, @intFromEnum(ContextMenuCmd.clear), L("Clear"));
+    _ = AppendMenuW(menu, MF_STRING, @intFromEnum(ContextMenuCmd.reset), L("Reset"));
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    if (CreatePopupMenu()) |split_menu| {
+        // Attached via MF_POPUP, so the parent owns and destroys it.
+        _ = AppendMenuW(split_menu, MF_STRING, @intFromEnum(ContextMenuCmd.split_right), L("Split Right"));
+        _ = AppendMenuW(split_menu, MF_STRING, @intFromEnum(ContextMenuCmd.split_down), L("Split Down"));
+        _ = AppendMenuW(split_menu, MF_STRING, @intFromEnum(ContextMenuCmd.split_left), L("Split Left"));
+        _ = AppendMenuW(split_menu, MF_STRING, @intFromEnum(ContextMenuCmd.split_up), L("Split Up"));
+        _ = AppendMenuW(menu, MF_POPUP, @intFromPtr(split_menu), L("Split"));
+        _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    }
+    _ = AppendMenuW(menu, MF_STRING, @intFromEnum(ContextMenuCmd.change_title), L("Change Title..."));
+    _ = AppendMenuW(menu, MF_STRING, @intFromEnum(ContextMenuCmd.command_palette), L("Command Palette"));
+
+    var pt: sys.POINT = .{
+        .x = @intFromFloat(surface.cursor_pos.x),
+        .y = @intFromFloat(surface.cursor_pos.y),
+    };
+    _ = ClientToScreen(hwnd, &pt);
+
+    // TPM_RETURNCMD blocks until the menu closes and returns the chosen
+    // command directly instead of posting WM_COMMAND.
+    const cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null);
+    log.debug("context menu at ({},{}) result cmd={} err={}", .{
+        pt.x, pt.y, cmd, std.os.windows.GetLastError(),
+    });
+    if (cmd <= 0) return;
+
+    const action: input.Binding.Action = switch (@as(ContextMenuCmd, @enumFromInt(@as(usize, @intCast(cmd))))) {
+        .copy => .{ .copy_to_clipboard = .mixed },
+        .paste => .paste_from_clipboard,
+        .clear => .clear_screen,
+        .reset => .reset,
+        .split_right => .{ .new_split = .right },
+        .split_down => .{ .new_split = .down },
+        .split_left => .{ .new_split = .left },
+        .split_up => .{ .new_split = .up },
+        .change_title => .prompt_surface_title,
+        .command_palette => .toggle_command_palette,
+        _ => return,
+    };
+    _ = core.performBindingAction(action) catch |err| {
+        log.err("context menu action failed: {}", .{err});
+    };
 }
