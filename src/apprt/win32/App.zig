@@ -568,7 +568,14 @@ pub fn performAction(
             return true;
         },
         .quit_timer => return true,
-        .mouse_over_link => return true,
+        .mouse_over_link => {
+            const surface = switch (target) {
+                .app => return false,
+                .surface => |core| core.rt_surface,
+            };
+            surface.setMouseOverLink(value.url);
+            return true;
+        },
         .inspector => {
             const core = switch (target) {
                 .app => return false,

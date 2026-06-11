@@ -139,6 +139,13 @@ layout_x: i32 = 0,
 layout_y: i32 = 0,
 layout_w: i32 = 0,
 
+/// Overlay shown at the bottom-left while the mouse hovers a link
+/// (mouse_over_link action), mirroring the GTK apprt's URL label.
+link_hwnd: ?HWND = null,
+link_visible: bool = false,
+link_text: [512:0]u16 = [_:0]u16{0} ** 512,
+link_len: usize = 0,
+
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const ProgressState = terminal.osc.Command.ProgressReport.State;
@@ -152,6 +159,25 @@ const SW_SHOWNORMAL: c_int = 1;
 const WM_PAINT: UINT = 0x000F;
 const WM_TIMER: UINT = 0x0113;
 var progress_class_registered: bool = false;
+var link_class_registered: bool = false;
+
+const SIZE = extern struct { cx: i32, cy: i32 };
+const DEFAULT_GUI_FONT: c_int = 17;
+const COLOR_INFOTEXT: c_int = 23;
+const COLOR_INFOBK: c_int = 24;
+const TRANSPARENT: c_int = 1;
+const DT_VCENTER: UINT = 0x0004;
+const DT_SINGLELINE: UINT = 0x0020;
+const DT_NOPREFIX: UINT = 0x0800;
+const DT_END_ELLIPSIS: UINT = 0x8000;
+
+extern "user32" fn GetSysColor(nIndex: c_int) callconv(.winapi) u32;
+extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: c_int, lprc: *RECT, format: UINT) callconv(.winapi) c_int;
+extern "gdi32" fn GetStockObject(i: c_int) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn SetTextColor(hdc: HDC, color: u32) callconv(.winapi) u32;
+extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.winapi) c_int;
+extern "gdi32" fn GetTextExtentPoint32W(hdc: HDC, lpString: [*]const u16, c: c_int, psizl: *SIZE) callconv(.winapi) BOOL;
 
 pub fn core(self: *Self) *CoreSurface {
     return self.core_surface.?;
@@ -201,6 +227,7 @@ pub fn init(self: *Self, parent: HWND, app: *App) !void {
     // Store self pointer on the child window for message handling
     _ = SetWindowLongPtrW(child, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     try self.createProgressOverlay();
+    try self.createLinkOverlay();
 
     try self.initOpenGL();
 }
@@ -266,6 +293,10 @@ pub fn deinit(self: *Self) void {
     if (self.progress_hwnd) |hwnd| {
         _ = DestroyWindow(hwnd);
         self.progress_hwnd = null;
+    }
+    if (self.link_hwnd) |hwnd| {
+        _ = DestroyWindow(hwnd);
+        self.link_hwnd = null;
     }
     if (self.core_surface) |surface| {
         surface.deinit();
@@ -473,6 +504,9 @@ pub fn setVisible(self: *Self, visible: bool) void {
     if (self.progress_hwnd) |hwnd| {
         _ = ShowWindow(hwnd, if (visible and self.progress_visible) SW_SHOWNORMAL else SW_HIDE);
     }
+    if (self.link_hwnd) |hwnd| {
+        _ = ShowWindow(hwnd, if (visible and self.link_visible) SW_SHOWNORMAL else SW_HIDE);
+    }
 }
 
 pub fn setProgressReport(self: *Self, value: terminal.osc.Command.ProgressReport) void {
@@ -569,6 +603,144 @@ fn paintProgress(self: *Self, hwnd: HWND) void {
         _ = FillRect(hdc, &fill, brush);
         _ = DeleteObject(brush);
     }
+}
+
+fn createLinkOverlay(self: *Self) !void {
+    try registerLinkClass();
+    const WS_CHILD: u32 = 0x40000000;
+    const hwnd = CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("GhosttyLinkOverlay"),
+        null,
+        WS_CHILD,
+        0,
+        0,
+        0,
+        0,
+        self.hwnd,
+        null,
+        GetModuleHandleW(null),
+        null,
+    ) orelse return error.Win32Error;
+    self.link_hwnd = hwnd;
+    _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+}
+
+fn registerLinkClass() !void {
+    if (link_class_registered) return;
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyLinkOverlay");
+    const hinstance = GetModuleHandleW(null);
+    var wc: WNDCLASSEXW = std.mem.zeroes(WNDCLASSEXW);
+    wc.cbSize = @sizeOf(WNDCLASSEXW);
+    wc.style = 0x0002 | 0x0001;
+    wc.lpfnWndProc = linkWndProc;
+    wc.hInstance = hinstance;
+    wc.hCursor = LoadCursorW(null, @ptrFromInt(32512));
+    wc.lpszClassName = class_name;
+    if (RegisterClassExW(&wc) == 0) return error.Win32Error;
+    link_class_registered = true;
+}
+
+fn linkWndProc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+    const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (ptr == 0) return DefWindowProcW(hwnd, msg, wparam, lparam);
+    const self: *Self = @ptrFromInt(@as(usize, @bitCast(ptr)));
+    switch (msg) {
+        WM_PAINT => {
+            self.paintLink(hwnd);
+            return 0;
+        },
+        else => {},
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// Show the hovered link URL in the bottom-left overlay, or hide it
+/// when the URL is empty.
+pub fn setMouseOverLink(self: *Self, url: []const u8) void {
+    const hwnd = self.link_hwnd orelse return;
+    if (url.len == 0) {
+        self.link_visible = false;
+        _ = ShowWindow(hwnd, SW_HIDE);
+        return;
+    }
+
+    // Cap the URL to the UTF-16 buffer. A UTF-8 sequence never expands
+    // to more UTF-16 code units than its byte length, so capping the
+    // byte length is sufficient; back up so we don't split a sequence.
+    var end = @min(url.len, self.link_text.len);
+    if (end < url.len) {
+        while (end > 0 and (url[end] & 0xC0) == 0x80) end -= 1;
+    }
+    const n = std.unicode.utf8ToUtf16Le(&self.link_text, url[0..end]) catch {
+        self.link_visible = false;
+        _ = ShowWindow(hwnd, SW_HIDE);
+        return;
+    };
+    if (n == 0) return;
+    self.link_len = n;
+    self.link_visible = true;
+    self.updateLinkOverlayRect();
+    _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    _ = InvalidateRect(hwnd, null, 0);
+}
+
+fn updateLinkOverlayRect(self: *Self) void {
+    const hwnd = self.link_hwnd orelse return;
+    if (!self.link_visible or self.link_len == 0) {
+        _ = ShowWindow(hwnd, SW_HIDE);
+        return;
+    }
+
+    var client: RECT = std.mem.zeroes(RECT);
+    _ = GetClientRect(self.hwnd, &client);
+
+    // Measure the text with the overlay font for a snug fit.
+    var size: SIZE = .{ .cx = 200, .cy = 16 };
+    const hdc = GetDC(self.hwnd);
+    if (hdc != null) {
+        const old = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+        _ = GetTextExtentPoint32W(hdc, &self.link_text, @intCast(self.link_len), &size);
+        _ = SelectObject(hdc, old);
+        _ = ReleaseDC(self.hwnd, hdc);
+    }
+
+    const pad: i32 = 4;
+    const w: i32 = @min(client.right - client.left, size.cx + pad * 2);
+    const h: i32 = size.cy + pad;
+    _ = SetWindowPos(hwnd, null, 0, client.bottom - h, w, h, 0x0004);
+}
+
+fn paintLink(self: *Self, hwnd: HWND) void {
+    var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
+    const hdc = BeginPaint(hwnd, &ps);
+    defer _ = EndPaint(hwnd, &ps);
+
+    var rect: RECT = std.mem.zeroes(RECT);
+    _ = GetClientRect(hwnd, &rect);
+
+    // System tooltip colors for a native look.
+    const bg = CreateSolidBrush(GetSysColor(COLOR_INFOBK));
+    if (bg != null) {
+        _ = FillRect(hdc, &rect, bg);
+        _ = DeleteObject(bg);
+    }
+
+    const old_font = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    defer _ = SelectObject(hdc, old_font);
+    _ = SetBkMode(hdc, TRANSPARENT);
+    _ = SetTextColor(hdc, GetSysColor(COLOR_INFOTEXT));
+
+    var text_rect = rect;
+    text_rect.left += 4;
+    text_rect.right -= 4;
+    _ = DrawTextW(
+        hdc,
+        &self.link_text,
+        @intCast(self.link_len),
+        &text_rect,
+        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
 }
 
 // --- Interface methods required by CoreSurface ---
