@@ -22,6 +22,10 @@ const log = std.log.scoped(.deferred_face);
 fc: if (options.backend == .fontconfig_freetype) ?Fontconfig else void =
     if (options.backend == .fontconfig_freetype) null else {},
 
+/// DirectWrite (Windows)
+dw: if (options.backend == .dwrite_freetype) ?DWrite else void =
+    if (options.backend == .dwrite_freetype) null else {},
+
 /// CoreText
 ct: if (font.Discover == font.discovery.CoreText) ?CoreText else void =
     if (font.Discover == font.discovery.CoreText) null else {},
@@ -47,6 +51,27 @@ pub const Fontconfig = struct {
 
     pub fn deinit(self: *Fontconfig) void {
         self.pattern.destroy();
+        self.* = undefined;
+    }
+};
+
+/// DirectWrite specific data: the resolved font file on disk plus
+/// display names. Only present when building with the dwrite backend.
+pub const DWrite = struct {
+    alloc: Allocator,
+
+    /// Font file path and face index inside it, for FreeType loading.
+    path: [:0]const u8,
+    index: u32,
+
+    /// Family and full display name as reported by DirectWrite.
+    family: [:0]const u8,
+    name: [:0]const u8,
+
+    pub fn deinit(self: *DWrite) void {
+        self.alloc.free(self.path);
+        self.alloc.free(self.family);
+        self.alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -87,6 +112,7 @@ pub const WebCanvas = struct {
 pub fn deinit(self: *DeferredFace) void {
     switch (options.backend) {
         .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
+        .dwrite_freetype => if (self.dw) |*dw| dw.deinit(),
         .freetype => {},
         .web_canvas => if (self.wc) |*wc| wc.deinit(),
         .coretext,
@@ -102,6 +128,8 @@ pub fn deinit(self: *DeferredFace) void {
 pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
+
+        .dwrite_freetype => if (self.dw) |dw| return dw.family,
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.family, 0)).string,
@@ -130,6 +158,8 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
 pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
+
+        .dwrite_freetype => if (self.dw) |dw| return dw.name,
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.fullname, 0)).string,
@@ -164,6 +194,7 @@ pub fn load(
 ) !Face {
     return switch (options.backend) {
         .fontconfig_freetype => try self.loadFontconfig(lib, opts),
+        .dwrite_freetype => try self.loadDWrite(lib, opts),
         .coretext, .coretext_harfbuzz, .coretext_noshape => try self.loadCoreText(lib, opts),
         .coretext_freetype => try self.loadCoreTextFreetype(lib, opts),
         .web_canvas => try self.loadWebCanvas(opts),
@@ -172,6 +203,15 @@ pub fn load(
         // proper configuration for one of the other deferred mechanisms.
         .freetype => unreachable,
     };
+}
+
+fn loadDWrite(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    const dw = self.dw.?;
+    return try Face.initFile(lib, dw.path, @intCast(dw.index), opts);
 }
 
 fn loadFontconfig(
@@ -342,6 +382,16 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
             };
             defer face.deinit();
             return face.glyphIndex(cp) != null;
+        },
+
+        // DirectWrite discovery filters by codepoint via
+        // IDWriteFont.HasCharacter before constructing the deferred
+        // face, so candidates reaching this point are assumed to match.
+        // Emoji presentation isn't tracked yet (the FreeType rasterizer
+        // resolves it at load time).
+        .dwrite_freetype => if (self.dw) |_| {
+            if (p) |desired| if (desired == .emoji) return false;
+            return true;
         },
 
         .freetype => {},

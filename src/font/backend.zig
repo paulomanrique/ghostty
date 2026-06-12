@@ -6,6 +6,10 @@ pub const Backend = enum {
     /// FreeType for font rendering with no font discovery enabled.
     freetype,
 
+    /// DirectWrite for font discovery and FreeType for font rendering
+    /// (Windows).
+    dwrite_freetype,
+
     /// Fontconfig for font discovery and FreeType for font rendering.
     fontconfig_freetype,
 
@@ -41,11 +45,11 @@ pub const Backend = enum {
         }
 
         if (target.os.tag == .windows) {
-            // Avoid fontconfig on Windows because its libxml2 dependency
-            // may not unpack due to symlinks. Use plain freetype for now
-            // which means no font discovery. Full solution would likely use
-            // DirectWrite which has its own discovery API.
-            return .freetype;
+            // DirectWrite for discovery (system font collection) and
+            // FreeType for rendering. Fontconfig is avoided on Windows
+            // because its libxml2 dependency may not unpack due to
+            // symlinks.
+            return .dwrite_freetype;
         }
 
         // macOS also supports "coretext_freetype" but there is no scenario
@@ -60,6 +64,7 @@ pub const Backend = enum {
     pub fn hasFreetype(self: Backend) bool {
         return switch (self) {
             .freetype,
+            .dwrite_freetype,
             .fontconfig_freetype,
             .coretext_freetype,
             => true,
@@ -81,6 +86,7 @@ pub const Backend = enum {
             => true,
 
             .freetype,
+            .dwrite_freetype,
             .fontconfig_freetype,
             .web_canvas,
             => false,
@@ -92,6 +98,7 @@ pub const Backend = enum {
             .fontconfig_freetype => true,
 
             .freetype,
+            .dwrite_freetype,
             .coretext,
             .coretext_freetype,
             .coretext_harfbuzz,
@@ -104,6 +111,7 @@ pub const Backend = enum {
     pub fn hasHarfbuzz(self: Backend) bool {
         return switch (self) {
             .freetype,
+            .dwrite_freetype,
             .fontconfig_freetype,
             .coretext_freetype,
             .coretext_harfbuzz,

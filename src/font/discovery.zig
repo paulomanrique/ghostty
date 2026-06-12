@@ -14,6 +14,7 @@ const log = std.log.scoped(.discovery);
 /// Discover implementation for the compile options.
 pub const Discover = switch (options.backend) {
     .freetype => void, // no discovery
+    .dwrite_freetype => @import("discovery_dwrite.zig").DWrite,
     .fontconfig_freetype => Fontconfig,
     .web_canvas => void, // no discovery
     .coretext,
