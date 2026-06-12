@@ -687,8 +687,24 @@ pub fn performAction(
         .color_change => return true,
         .pwd => return true,
         .secure_input => return true,
-        .initial_size, .cell_size, .size_limit => return true,
-        .scrollbar => return true,
+        .initial_size => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const window = core.rt_surface.window orelse return false;
+            window.setInitialSize(value.width, value.height);
+            return true;
+        },
+        .cell_size, .size_limit => return true,
+        .scrollbar => {
+            const surface = switch (target) {
+                .app => return false,
+                .surface => |core| core.rt_surface,
+            };
+            surface.setScrollbar(value);
+            return true;
+        },
         .close_all_windows => {
             // Close all windows
             var i = self.windows.items.len;
@@ -891,7 +907,7 @@ pub fn performAction(
         },
         .toggle_tab_overview => {
             const window = self.focused_window orelse return false;
-            if (window.tab_hwnd) |hwnd| _ = sys.SetFocus(hwnd);
+            self.showTabOverview(window);
             return true;
         },
         .toggle_quick_terminal => {
@@ -1499,6 +1515,28 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             }
             return 0;
         },
+        0x0115 => { // WM_VSCROLL from the native scrollbar
+            if (surface.core_surface) |core| {
+                const input = @import("../../input.zig");
+                const code: u16 = @truncate(wparam & 0xFFFF);
+                const action: ?input.Binding.Action = switch (code) {
+                    0 => .{ .scroll_page_lines = -1 }, // SB_LINEUP
+                    1 => .{ .scroll_page_lines = 1 }, // SB_LINEDOWN
+                    2 => .scroll_page_up, // SB_PAGEUP
+                    3 => .scroll_page_down, // SB_PAGEDOWN
+                    4, 5 => track: { // SB_THUMBPOSITION, SB_THUMBTRACK
+                        const pos = surface.getScrollTrackPos();
+                        if (pos < 0) break :track null;
+                        break :track .{ .scroll_to_row = @intCast(pos) };
+                    },
+                    6 => .scroll_to_top, // SB_TOP
+                    7 => .scroll_to_bottom, // SB_BOTTOM
+                    else => null,
+                };
+                if (action) |a| _ = core.performBindingAction(a) catch {};
+            }
+            return 0;
+        },
         0x010D => { // WM_IME_STARTCOMPOSITION
             if (surface.core_surface) |core| {
                 core.renderer_state.mutex.lock();
@@ -1591,6 +1629,34 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Show a popup listing all tabs of the window (toggle_tab_overview).
+/// The selected tab is activated; menu IDs are tab index + 1 since
+/// TrackPopupMenu with TPM_RETURNCMD returns 0 for "no selection".
+fn showTabOverview(self: *App, window: *Window) void {
+    const hwnd = window.hwnd orelse return;
+    if (window.tabs.items.len == 0) return;
+
+    const menu = CreatePopupMenu() orelse return;
+    defer _ = DestroyMenu(menu);
+
+    const MF_CHECKED: UINT = 0x0008;
+    for (window.tabs.items, 0..) |tab, i| {
+        var buf: [600]u8 = undefined;
+        const label = std.fmt.bufPrintZ(&buf, "{d}: {s}", .{ i + 1, tab.title }) catch tab.title;
+        const label16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, label) catch continue;
+        defer self.alloc.free(label16);
+        const flags: UINT = if (i == window.current_tab) MF_STRING | MF_CHECKED else MF_STRING;
+        _ = AppendMenuW(menu, flags, i + 1, label16.ptr);
+    }
+
+    // Anchor just below the tab bar.
+    var pt: sys.POINT = .{ .x = 8, .y = 36 };
+    _ = ClientToScreen(hwnd, &pt);
+    const cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null);
+    if (cmd <= 0) return;
+    window.activateTab(@intCast(cmd - 1)) catch {};
 }
 
 /// Command IDs for the right-click context menu. Must be non-zero since

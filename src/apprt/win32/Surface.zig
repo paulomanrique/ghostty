@@ -146,6 +146,10 @@ link_visible: bool = false,
 link_text: [512:0]u16 = [_:0]u16{0} ** 512,
 link_len: usize = 0,
 
+/// Last scrollbar state reported by the core (rows).
+scroll_state: terminal.Scrollbar = .zero,
+scrollbar_shown: bool = false,
+
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const ProgressState = terminal.osc.Command.ProgressReport.State;
@@ -171,6 +175,25 @@ const DT_SINGLELINE: UINT = 0x0020;
 const DT_NOPREFIX: UINT = 0x0800;
 const DT_END_ELLIPSIS: UINT = 0x8000;
 
+const SCROLLINFO = extern struct {
+    cbSize: u32,
+    fMask: u32,
+    nMin: i32,
+    nMax: i32,
+    nPage: u32,
+    nPos: i32,
+    nTrackPos: i32,
+};
+const SB_VERT: c_int = 1;
+const SIF_RANGE: u32 = 0x0001;
+const SIF_PAGE: u32 = 0x0002;
+const SIF_POS: u32 = 0x0004;
+const SIF_DISABLENOSCROLL: u32 = 0x0008;
+const SIF_TRACKPOS: u32 = 0x0010;
+
+extern "user32" fn ShowScrollBar(hWnd: HWND, wBar: c_int, bShow: BOOL) callconv(.winapi) BOOL;
+extern "user32" fn SetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *const SCROLLINFO, redraw: BOOL) callconv(.winapi) c_int;
+extern "user32" fn GetScrollInfo(hWnd: HWND, nBar: c_int, lpsi: *SCROLLINFO) callconv(.winapi) BOOL;
 extern "user32" fn GetSysColor(nIndex: c_int) callconv(.winapi) u32;
 extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: c_int, lprc: *RECT, format: UINT) callconv(.winapi) c_int;
 extern "gdi32" fn GetStockObject(i: c_int) callconv(.winapi) ?*anyopaque;
@@ -603,6 +626,39 @@ fn paintProgress(self: *Self, hwnd: HWND) void {
         _ = FillRect(hdc, &fill, brush);
         _ = DeleteObject(brush);
     }
+}
+
+/// Update the native vertical scrollbar from the terminal scrollback
+/// state (rows). Hidden while there is nothing to scroll.
+pub fn setScrollbar(self: *Self, value: terminal.Scrollbar) void {
+    self.scroll_state = value;
+    const show = value.total > value.len;
+    if (show != self.scrollbar_shown) {
+        self.scrollbar_shown = show;
+        _ = ShowScrollBar(self.hwnd, SB_VERT, if (show) 1 else 0);
+    }
+    if (!show) return;
+
+    var si: SCROLLINFO = .{
+        .cbSize = @sizeOf(SCROLLINFO),
+        .fMask = SIF_RANGE | SIF_PAGE | SIF_POS,
+        .nMin = 0,
+        .nMax = @intCast(value.total - 1),
+        .nPage = @intCast(value.len),
+        .nPos = @intCast(value.offset),
+        .nTrackPos = 0,
+    };
+    _ = SetScrollInfo(self.hwnd, SB_VERT, &si, 1);
+}
+
+/// 32-bit thumb position during a drag (the WM_VSCROLL wparam is
+/// limited to 16 bits).
+pub fn getScrollTrackPos(self: *Self) i32 {
+    var si: SCROLLINFO = std.mem.zeroes(SCROLLINFO);
+    si.cbSize = @sizeOf(SCROLLINFO);
+    si.fMask = SIF_TRACKPOS;
+    if (GetScrollInfo(self.hwnd, SB_VERT, &si) == 0) return -1;
+    return si.nTrackPos;
 }
 
 fn createLinkOverlay(self: *Self) !void {

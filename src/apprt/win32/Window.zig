@@ -674,7 +674,7 @@ fn updateTabControlTitle(self: *Window, index: usize) void {
     _ = sys.SendMessageW(hwnd, TCM_SETITEMW, index, @bitCast(@intFromPtr(&item)));
 }
 
-fn activateTab(self: *Window, index: usize) !void {
+pub fn activateTab(self: *Window, index: usize) !void {
     if (self.tabs.items.len == 0 or index >= self.tabs.items.len) return;
     if (index == self.current_tab and self.tree != null) {
         _ = sys.SendMessageW(self.tab_hwnd.?, TCM_SETCURSEL, index, 0);
@@ -881,6 +881,26 @@ pub fn applyConfiguredWindowSize(self: *Window) void {
     const w: i32 = @intCast(@max(10, cfg_w) * cell_width);
     const h: i32 = @intCast(@as(i32, @intCast(@max(4, cfg_h) * cell_height)) + self.tabClientHeight());
 
+    var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
+    _ = sys.AdjustWindowRectEx(&rect, sys.WS_OVERLAPPEDWINDOW, 0, 0);
+    _ = sys.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x0002 | 0x0004);
+}
+
+/// Resize the window so the surface area matches the requested pixel
+/// size (initial_size action). Only applies to a plain single-surface
+/// window; splits, extra tabs, fullscreen, maximized windows, and the
+/// quick terminal keep their current layout.
+pub fn setInitialSize(self: *Window, width: u32, height: u32) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.quick_terminal or self.fullscreen.active) return;
+    if (self.tabs.items.len > 1) return;
+    if (sys.IsZoomed(hwnd) != 0) return;
+    const tree = &(self.tree orelse return);
+    var leaves: [64]*Surface = undefined;
+    if (tree.collectLeaves(&leaves) != 1) return;
+
+    const w: i32 = @intCast(width);
+    const h: i32 = @as(i32, @intCast(height)) + self.tabClientHeight();
     var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
     _ = sys.AdjustWindowRectEx(&rect, sys.WS_OVERLAPPEDWINDOW, 0, 0);
     _ = sys.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x0002 | 0x0004);
