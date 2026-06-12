@@ -666,7 +666,7 @@ pub fn performAction(
         },
         .toggle_split_zoom => {
             const window = self.focused_window orelse return false;
-            window.relayout();
+            window.toggleSplitZoom();
             return true;
         },
         .render => {

@@ -139,6 +139,10 @@ quick_terminal: bool = false,
 dividers: std.ArrayListUnmanaged(*DividerState) = .{},
 drag: ?DividerDrag = null,
 
+/// When set, this surface of the current tab's tree takes the whole
+/// split area and all other splits are hidden (toggle_split_zoom).
+zoomed_surface: ?*Surface = null,
+
 const FullscreenState = struct {
     active: bool = false,
     style: i32 = 0,
@@ -932,8 +936,50 @@ pub fn relayout(self: *Window) void {
         .w = rect.right - rect.left,
         .h = rect.bottom - rect.top - tab_h,
     };
+    if (self.zoomed_surface) |zoomed| {
+        // The zoomed surface may have left the tree (tab switch, close);
+        // in that case drop the zoom and lay out normally.
+        if (tree.findLeaf(zoomed) != null) {
+            relayoutCb(zoomed, bounds);
+            self.hideAllDividers();
+            return;
+        }
+        self.zoomed_surface = null;
+    }
     tree.layout(bounds, relayoutCb);
     self.updateDividers(bounds);
+}
+
+/// Toggle zooming the focused split to the whole split area. No-op for
+/// a single-leaf tree.
+pub fn toggleSplitZoom(self: *Window) void {
+    if (self.zoomed_surface != null) {
+        self.unzoomSplit();
+        return;
+    }
+
+    const tree = &(self.tree orelse return);
+    const focused = self.getFocusedSurface() orelse return;
+    var leaves: [64]*Surface = undefined;
+    const count = tree.collectLeaves(&leaves);
+    if (count <= 1) return;
+
+    self.zoomed_surface = focused;
+    for (leaves[0..count]) |surface| {
+        if (surface != focused) surface.setVisible(false);
+    }
+    self.relayout();
+}
+
+fn unzoomSplit(self: *Window) void {
+    if (self.zoomed_surface == null) return;
+    self.zoomed_surface = null;
+    const tree = &(self.tree orelse return);
+    var leaves: [64]*Surface = undefined;
+    for (leaves[0..tree.collectLeaves(&leaves)]) |surface| {
+        surface.setVisible(true);
+    }
+    self.relayout();
 }
 
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
@@ -947,6 +993,7 @@ pub fn newTab(self: *Window, opts: CreateOptions) !void {
 }
 
 pub fn newSplit(self: *Window, existing: *Surface, dir: apprt.action.SplitDirection) !void {
+    self.unzoomSplit();
     const tree = &(self.tree orelse return error.NoTree);
     const alloc = self.app.alloc;
 
@@ -982,6 +1029,7 @@ pub fn newSplit(self: *Window, existing: *Surface, dir: apprt.action.SplitDirect
 }
 
 pub fn closeSurface(self: *Window, surface: *Surface) void {
+    if (self.zoomed_surface == surface) self.unzoomSplit();
     const tab_idx = self.findTabIndexForSurface(surface) orelse return;
     const use_active = tab_idx == self.current_tab and self.tree != null;
     var tree_copy = if (use_active) self.tree.? else self.tabs.items[tab_idx].tree;
@@ -1019,6 +1067,9 @@ pub fn closeSurface(self: *Window, surface: *Surface) void {
 }
 
 pub fn gotoSplit(self: *Window, target: apprt.action.GotoSplit) void {
+    // Navigating between splits leaves zoom; the target would
+    // otherwise be hidden.
+    self.unzoomSplit();
     const tree = &(self.tree orelse return);
     const current = self.focused_surface orelse return;
 
