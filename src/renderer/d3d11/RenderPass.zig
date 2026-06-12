@@ -110,16 +110,26 @@ pub fn step(self: *Self, s: Step) void {
     }
 
     // Buffer 0 is the vertex/instance buffer; the rest are storage
-    // buffers bound as StructuredBuffer SRVs at the matching t-slot in
-    // both stages. Textures are bound afterwards so they take priority
-    // on the pixel stage (no current step needs both).
+    // buffers bound as StructuredBuffer SRVs at the matching t-slot.
+    // SRV slots can collide between storage buffers and textures (e.g.
+    // cell_text uses t1 for bg_colors in the VS and for the color
+    // atlas in the PS), so the bind order is chosen per stage: on the
+    // vertex stage textures bind first and storage buffers win the
+    // conflicts; on the pixel stage it's the reverse.
     if (s.buffers.len > 0) {
         if (s.buffers[0]) |vbo| {
             const strides = [1]u32{@intCast(s.pipeline.stride)};
             const offsets = [1]u32{0};
             ctx.iaSetVertexBuffers(0, &.{vbo.res}, &strides, &offsets);
         }
+    }
 
+    for (s.textures, 0..) |t, i| if (t) |tex| {
+        var srvs = [1]?*com.ID3D11ShaderResourceView{tex.srv};
+        ctx.vsSetShaderResources(@intCast(i), &srvs);
+    };
+
+    if (s.buffers.len > 1) {
         for (s.buffers[1..], 1..) |b, i| if (b) |buf| {
             if (buf.srv) |srv| {
                 var srvs = [1]?*com.ID3D11ShaderResourceView{srv};
@@ -129,7 +139,6 @@ pub fn step(self: *Self, s: Step) void {
         };
     }
 
-    // Bind textures and samplers on the pixel stage.
     for (s.textures, 0..) |t, i| if (t) |tex| {
         var srvs = [1]?*com.ID3D11ShaderResourceView{tex.srv};
         ctx.psSetShaderResources(@intCast(i), &srvs);
