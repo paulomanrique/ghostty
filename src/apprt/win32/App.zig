@@ -85,6 +85,7 @@ extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?*anyopaque;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: ?*anyopaque) callconv(.winapi) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(hIMC: ?*anyopaque, dwIndex: DWORD, lpBuf: ?*anyopaque, dwBufLen: DWORD) callconv(.winapi) i32;
 extern "imm32" fn ImmSetCompositionWindow(hIMC: ?*anyopaque, lpCompForm: *COMPOSITIONFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionFontW(hIMC: ?*anyopaque, lplf: *LOGFONTW) callconv(.winapi) BOOL;
 extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
@@ -1527,6 +1528,53 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 }
             }
             return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x010F => { // WM_IME_COMPOSITION: draw the preedit inline
+            if (surface.core_surface) |core| ime: {
+                const GCS_COMPSTR: u32 = 0x0008;
+                const GCS_RESULTSTR: u32 = 0x0800;
+                const flags: u32 = @truncate(@as(usize, @bitCast(lparam)));
+
+                // The result string is delivered through the regular
+                // char path by DefWindowProc; just drop the preedit.
+                if (flags & GCS_RESULTSTR != 0) {
+                    core.preeditCallback(null) catch {};
+                    break :ime;
+                }
+                if (flags & GCS_COMPSTR == 0) break :ime;
+
+                const himc = ImmGetContext(hwnd) orelse break :ime;
+                defer _ = ImmReleaseContext(hwnd, himc);
+
+                var buf16: [256]u16 = undefined;
+                const bytes = ImmGetCompositionStringW(
+                    himc,
+                    GCS_COMPSTR,
+                    &buf16,
+                    @sizeOf(@TypeOf(buf16)),
+                );
+                if (bytes <= 0) {
+                    core.preeditCallback(null) catch {};
+                    break :ime;
+                }
+
+                var buf8: [768]u8 = undefined;
+                const len = std.unicode.utf16LeToUtf8(
+                    &buf8,
+                    buf16[0..@intCast(@divTrunc(bytes, 2))],
+                ) catch break :ime;
+                core.preeditCallback(buf8[0..len]) catch {};
+            }
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x010E => { // WM_IME_ENDCOMPOSITION: composition done or cancelled
+            if (surface.core_surface) |core| core.preeditCallback(null) catch {};
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x0281 => { // WM_IME_SETCONTEXT: hide the system composition UI
+            const ISC_SHOWUICOMPOSITIONWINDOW: usize = 0x80000000;
+            const cleared: LPARAM = @bitCast(@as(usize, @bitCast(lparam)) & ~ISC_SHOWUICOMPOSITIONWINDOW);
+            return sys.DefWindowProcW(hwnd, msg, wparam, cleared);
         },
         0x0007, 0x0008 => {
             if (surface.core_surface) |core| {
