@@ -6,6 +6,7 @@ const Self = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const build_config = @import("../../build_config.zig");
 const configpkg = @import("../../config.zig");
 const CoreSurface = @import("../../Surface.zig");
 const CoreApp = @import("../../App.zig");
@@ -252,7 +253,9 @@ pub fn init(self: *Self, parent: HWND, app: *App) !void {
     try self.createProgressOverlay();
     try self.createLinkOverlay();
 
-    try self.initOpenGL();
+    // The D3D11 renderer owns its swapchain; only OpenGL needs a WGL
+    // context attached to the surface window.
+    if (comptime build_config.renderer == .opengl) try self.initOpenGL();
 }
 
 var surface_class_registered: bool = false;
@@ -325,12 +328,14 @@ pub fn deinit(self: *Self) void {
         surface.deinit();
         // core_surface is allocated by CoreApp, freed there
     }
-    if (self.hglrc != null) {
-        _ = wglMakeCurrent(null, null);
-        _ = wglDeleteContext(self.hglrc);
-    }
-    if (self.hdc != null) {
-        _ = ReleaseDC(self.hwnd, self.hdc);
+    if (comptime build_config.renderer == .opengl) {
+        if (self.hglrc != null) {
+            _ = wglMakeCurrent(null, null);
+            _ = wglDeleteContext(self.hglrc);
+        }
+        if (self.hdc != null) {
+            _ = ReleaseDC(self.hwnd, self.hdc);
+        }
     }
 }
 
@@ -489,8 +494,10 @@ extern "user32" fn SetCursor(hCursor: ?*anyopaque) callconv(.winapi) ?*anyopaque
 extern "user32" fn ShowCursor(bShow: i32) callconv(.winapi) i32;
 
 /// Update the OpenGL viewport to match the current window size.
-/// Called from the renderer thread before each frame.
+/// Called from the renderer thread before each frame. The D3D11
+/// renderer sets its own viewport per render pass.
 pub fn updateViewport(self: *Self) void {
+    if (comptime build_config.renderer != .opengl) return;
     glViewport(0, 0, @intCast(self.width), @intCast(self.height));
 }
 
